@@ -13,25 +13,32 @@ Response:
       "rtf": 0.218          # synth_seconds / audio_seconds; want < 1
     }
 
-The engine loads ONCE at module import (cold start) and is reused across
-warm invocations, so only the first request on a fresh worker pays load time.
+IMPORTANT - multiprocessing safety:
+LMDeploy spawns worker subprocesses, and each child re-imports this module.
+So the heavy TTSEngine load MUST be lazy (inside the handler), NOT at module
+top level - otherwise every spawned child re-loads the engine on import and the
+pool collapses with BrokenProcessPool / "safe importing of main module".
 """
+
+import multiprocessing as mp
+
+# Force 'spawn' before anything heavy is imported. Guarded so re-entry is safe.
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
 
 import os
 import io
 import time
 import base64
+import subprocess
 import traceback
 
 import soundfile as sf
 import runpod
 
 from Maya1.tts_engine import TTSEngine
-
-
-import os, subprocess
-print("HF_HOME =", os.environ.get("HF_HOME"))
-print(subprocess.run(["df", "-h"], capture_output=True, text=True).stdout)
 
 # FastMaya upsamples Maya1's native 24 kHz to 48 kHz via its AudioSR stage.
 SAMPLE_RATE = 48_000
@@ -40,11 +47,27 @@ SAMPLE_RATE = 48_000
 MEMORY_UTIL = float(os.environ.get("MAYA_MEMORY_UTIL", "0.8"))  # frac of VRAM
 TP = int(os.environ.get("MAYA_TP", "1"))                        # tensor parallel / #GPUs
 
-# ---- Cold start: load model once -----------------------------------------
-print(f"[cold-start] Loading FastMaya TTSEngine (memory_util={MEMORY_UTIL}, tp={TP}) ...")
-_t0 = time.time()
-engine = TTSEngine(memory_util=MEMORY_UTIL, tp=TP)
-print(f"[cold-start] Engine ready in {time.time() - _t0:.1f}s")
+# One-time debug: where is HF caching, and how much disk is where.
+print("[debug] HF_HOME =", os.environ.get("HF_HOME"))
+try:
+    print("[debug] disk:\n" + subprocess.run(
+        ["df", "-h"], capture_output=True, text=True).stdout)
+except Exception as _e:  # noqa
+    print("[debug] df failed:", _e)
+
+# ---- Lazy singleton: engine loads on FIRST request, in the main process ----
+_engine = None
+
+
+def get_engine():
+    global _engine
+    if _engine is None:
+        print(f"[cold-start] Loading FastMaya TTSEngine "
+              f"(memory_util={MEMORY_UTIL}, tp={TP}) ...")
+        t0 = time.time()
+        _engine = TTSEngine(memory_util=MEMORY_UTIL, tp=TP)
+        print(f"[cold-start] Engine ready in {time.time() - t0:.1f}s")
+    return _engine
 
 
 def handler(event):
@@ -56,8 +79,10 @@ def handler(event):
         if not text or not voice:
             return {"error": "Both 'text' and 'voice' are required in input."}
 
+        eng = get_engine()
+
         t0 = time.time()
-        audio = engine.generate(text, voice)   # 1-D float numpy @ 48 kHz
+        audio = eng.generate(text, voice)        # 1-D float numpy @ 48 kHz
         synth_s = time.time() - t0
 
         # Encode to WAV in-memory, then base64 for JSON transport.
@@ -80,4 +105,7 @@ def handler(event):
         return {"error": str(e), "trace": traceback.format_exc()}
 
 
-runpod.serverless.start({"handler": handler})
+# Guard the entrypoint so spawned children re-importing this module do NOT
+# restart the serverless loop.
+if __name__ == "__main__":
+    runpod.serverless.start({"handler": handler})
