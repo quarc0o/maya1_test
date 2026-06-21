@@ -28,6 +28,11 @@ import runpod
 
 from Maya1.tts_engine import TTSEngine
 
+
+import os, subprocess
+print("HF_HOME =", os.environ.get("HF_HOME"))
+print(subprocess.run(["df", "-h"], capture_output=True, text=True).stdout)
+
 # FastMaya upsamples Maya1's native 24 kHz to 48 kHz via its AudioSR stage.
 SAMPLE_RATE = 48_000
 
